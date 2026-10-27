@@ -250,7 +250,7 @@ func (c *Consumer) republish(ctx context.Context, ch *amqp091.Channel, taskID ui
 		return err
 	}
 	return ch.PublishWithContext(ctx, ExchangeTasks, RoutingKey, false, false,
-		publishing(body, amqp091.Table{HeaderRetryCount: int64(nextRetry)}))
+		newPublishing(body, amqp091.Table{HeaderRetryCount: int64(nextRetry)}))
 }
 
 // deadLetter 把原消息投递到死信 exchange（落入 blog.task.dlq）后 ack；
@@ -261,7 +261,7 @@ func (c *Consumer) deadLetter(ctx context.Context, ch *amqp091.Channel, d amqp09
 		c.OnDead(ctx, taskID)
 	}
 	err := ch.PublishWithContext(ctx, ExchangeDLX, RoutingKey, false, false,
-		publishing(d.Body, d.Headers))
+		newPublishing(d.Body, d.Headers))
 	if err != nil {
 		c.log.Error("投递死信队列失败", zap.Uint("task_id", taskID), zap.Error(err))
 	}

@@ -134,8 +134,8 @@ func marshalTask(taskID uint) ([]byte, error) {
 	return json.Marshal(TaskMessage{TaskID: taskID})
 }
 
-// publishing 构造持久化任务消息。
-func publishing(body []byte, headers amqp091.Table) amqp091.Publishing {
+// newPublishing 构造持久化任务消息。
+func newPublishing(body []byte, headers amqp091.Table) amqp091.Publishing {
 	if headers == nil {
 		headers = amqp091.Table{}
 	}
