@@ -1,4 +1,4 @@
-# 生产编排：nginx 统一入口 + server/blog/admin 三端 + 四中间件，共 8 个服务。
+# 生产编排：nginx 统一入口 + server/blog/admin 三端 + 三中间件（MySQL 用云数据库，不在编排内），共 7 个服务。
 # 与本地根目录 docker-compose.yml 的关键差异：
 #   1. 中间件端口一律不映射宿主机（只有 nginx 的 80/443 对外）；RabbitMQ 管理界面绑回环走 SSH 隧道
 #   2. 全部服务 restart: unless-stopped + 日志限额，named volume 持久化（向量库数据必须落盘）
@@ -56,13 +56,11 @@ services:
       - TZ=Asia/Shanghai
       # compose 拓扑固定项（非私密）：覆盖 config.yaml 里的本机开发地址
       - SERVER_MODE=release
-      - MYSQL_HOST=mysql
-      - MYSQL_PORT=3306
       - REDIS_ADDR=redis:6379
       - QDRANT_BASE_URL=http://qdrant:6333
+      # MySQL 连云数据库，不经此写死：实例地址因环境而异，走 .env 的
+      # MYSQL_HOST/MYSQL_PORT/MYSQL_PASSWORD 注入（environment 优先级高于 env_file，写死会盖掉 .env）
     depends_on:
-      mysql:
-        condition: service_healthy
       redis:
         condition: service_healthy
       rabbitmq:
@@ -103,27 +101,7 @@ services:
       - TZ=Asia/Shanghai
     logging: *default-logging
 
-  # ── 四中间件（一律不映射公网端口）──────────────────────────
-  mysql:
-    image: mysql:8.0
-    container_name: blog-mysql
-    restart: unless-stopped
-    environment:
-      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?请在 .env 中设置 MYSQL_ROOT_PASSWORD}
-      MYSQL_DATABASE: blog
-      TZ: Asia/Shanghai
-    command:
-      - --character-set-server=utf8mb4
-      - --collation-server=utf8mb4_unicode_ci
-    volumes:
-      - mysql-data:/var/lib/mysql
-    logging: *default-logging
-    healthcheck:
-      test: ["CMD-SHELL", "mysqladmin ping -h localhost -uroot -p$$MYSQL_ROOT_PASSWORD"]
-      interval: 5s
-      timeout: 3s
-      retries: 30
-
+  # ── 三中间件（一律不映射公网端口；MySQL 已换云数据库，不在编排内）──
   redis:
     image: redis:7-alpine
     container_name: blog-redis
@@ -179,7 +157,6 @@ services:
       retries: 20
 
 volumes:
-  mysql-data:
   redis-data:
   rabbitmq-data:
   qdrant-data:
