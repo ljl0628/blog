@@ -227,7 +227,12 @@ func (c *Consumer) retryOrFail(ctx context.Context, ch *amqp091.Channel, d amqp0
 			c.Logf(ctx, taskID, "第 %d 次执行失败：%v", retry+1, lastErr)
 			c.Logf(ctx, taskID, "将自动重试（重试上限 %d 次），消息已重新入队", c.cfg.MaxRetry)
 		}
+		// 重投不走 Nack requeue：requeue 改不了 header 里的重试计数（永远数不到
+		// 上限、进不了死信队列），且消息会插回队头附近，分钟级任务零间隔反复重跑；
+		// 改为发一条计数 +1 的新消息（排队尾，天然隔开一轮）再 ack 原消息完成交接。
 		if err := c.republish(ctx, ch, taskID, retry+1); err != nil {
+			// 新消息没发出去，原消息不能丢：回队（计数不变），下轮消费进来再试发布，
+			// 保证新旧消息至少活一条
 			logger.Error("重投失败，消息重新入队", zap.Error(err))
 			metricConsumedTotal.WithLabelValues("requeue").Inc()
 			_ = d.Nack(false, true)
@@ -235,7 +240,8 @@ func (c *Consumer) retryOrFail(ctx context.Context, ch *amqp091.Channel, d amqp0
 		}
 		logger.Info("已重投任务消息", zap.Int("next_retry", retry+1))
 		metricConsumedTotal.WithLabelValues("retry").Inc()
-		_ = d.Ack(false)
+		// 交接完成，丢弃原消息；ack 失败仅致原消息多投一次，由流水线幂等收敛
+		_ = d.Ack(false) // 丢弃原消息
 		return
 	}
 	// 重试超限：标记失败并进入死信队列
