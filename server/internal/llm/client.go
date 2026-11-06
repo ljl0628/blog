@@ -180,7 +180,7 @@ func (c *Client) throttle(ctx context.Context) error {
 	if c.rdb == nil || c.cfg.RatePerMinute <= 0 {
 		return nil
 	}
-	key := fmt.Sprintf("llm:ratelimit:%d", time.Now().Unix()/60)
+	key := fmt.Sprintf("llm:ratelimit:%d", time.Now().Unix()/60) // 当前秒/60, 取整。即当前第几分钟
 	for {
 		n, err := c.rdb.Incr(ctx, key).Result()
 		if err != nil {
