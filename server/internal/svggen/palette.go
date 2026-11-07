@@ -3,22 +3,87 @@ package svggen
 import (
 	"fmt"
 	"strings"
+	"sync"
 )
 
-// 统一暗色常量与画布宽度。
-const (
-	baseW    = 1200
-	cBG      = "#0F172A"
-	cBG2     = "#1E293B"
-	cPanel   = "#16213A"
-	cBorder  = "#2E3F5C"
-	cPanel2  = "#1C2A47"
-	cAccent  = "#38BDF8"
-	cAccent2 = "#A78BFA"
-	cAccent3 = "#34D399"
-	cText    = "#E2E8F0"
-	cMuted   = "#94A3B8"
+// palette 一套图表配色的全部色槽；渲染器只引用色槽变量，不感知主题。
+type palette struct {
+	BG, BG2, Panel, Panel2, Border string
+	Accent, Accent2, Accent3       string
+	Text, Muted                    string
+}
+
+// themes 预设主题，key 为 spec data 里的可选 theme 字段值。
+// 配色约束：背景与面板同色系分层、文字对比度足、三强调色分工不变
+// （Accent 主强调 / Accent2 次强调 / Accent3 成功态）。
+var themes = map[string]palette{
+	// midnight 深空蓝（历史默认，存量 spec 无 theme 字段时使用）
+	"midnight": {
+		BG: "#0F172A", BG2: "#1E293B", Panel: "#16213A", Panel2: "#1C2A47", Border: "#2E3F5C",
+		Accent: "#38BDF8", Accent2: "#A78BFA", Accent3: "#34D399", Text: "#E2E8F0", Muted: "#94A3B8",
+	},
+	// ocean 海洋蓝：整体提亮的蓝调背景
+	"ocean": {
+		BG: "#0C4A6E", BG2: "#075985", Panel: "#0E5387", Panel2: "#11589A", Border: "#2A6FA3",
+		Accent: "#7DD3FC", Accent2: "#C4B5FD", Accent3: "#6EE7B7", Text: "#E0F2FE", Muted: "#A5CDE8",
+	},
+	// light 浅色：浅底深字
+	"light": {
+		BG: "#F8FAFC", BG2: "#EEF2F7", Panel: "#FFFFFF", Panel2: "#F1F5F9", Border: "#CBD5E1",
+		Accent: "#0284C7", Accent2: "#7C3AED", Accent3: "#059669", Text: "#1E293B", Muted: "#64748B",
+	},
+	// forest 森林绿
+	"forest": {
+		BG: "#06281E", BG2: "#0C3B2C", Panel: "#0A3327", Panel2: "#0E4030", Border: "#1D5C46",
+		Accent: "#34D399", Accent2: "#FBBF24", Accent3: "#93C5FD", Text: "#D1FAE5", Muted: "#8CC0AA",
+	},
+}
+
+// defaultThemeName 默认主题（存量 spec 无 theme 字段时的历史深色）。
+const defaultThemeName = "midnight"
+
+// 画布宽度。
+const baseW = 1200
+
+// 色槽变量：随主题切换重赋值，须在 renderMu 内访问。
+var (
+	renderMu sync.Mutex // 主题为包级状态，渲染全程持锁防并发互踩
+	cBG      = themes[defaultThemeName].BG
+	cBG2     = themes[defaultThemeName].BG2
+	cPanel   = themes[defaultThemeName].Panel
+	cPanel2  = themes[defaultThemeName].Panel2
+	cBorder  = themes[defaultThemeName].Border
+	cAccent  = themes[defaultThemeName].Accent
+	cAccent2 = themes[defaultThemeName].Accent2
+	cAccent3 = themes[defaultThemeName].Accent3
+	cText    = themes[defaultThemeName].Text
+	cMuted   = themes[defaultThemeName].Muted
 )
+
+// applyPalette 重设全部色槽变量（须持 renderMu）。
+func applyPalette(p palette) {
+	cBG, cBG2, cPanel, cPanel2, cBorder = p.BG, p.BG2, p.Panel, p.Panel2, p.Border
+	cAccent, cAccent2, cAccent3 = p.Accent, p.Accent2, p.Accent3
+	cText, cMuted = p.Text, p.Muted
+}
+
+// IsValidTheme 判断是否为已知预设主题名（LLM 输出的 theme 落库前校验用）。
+func IsValidTheme(name string) bool {
+	_, ok := themes[name]
+	return ok
+}
+
+// renderWithTheme 在指定主题下执行渲染；未知主题回退默认。
+func renderWithTheme(name string, fn func() (string, error)) (string, error) {
+	renderMu.Lock()
+	defer renderMu.Unlock()
+	p, ok := themes[name]
+	if !ok {
+		p = themes[defaultThemeName]
+	}
+	applyPalette(p)
+	return fn()
+}
 
 // fontFamily SVG 文本字体。
 const fontFamily = `'Segoe UI','PingFang SC','Microsoft YaHei',sans-serif`

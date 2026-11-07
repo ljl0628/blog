@@ -13,7 +13,18 @@ type CoverInput struct {
 }
 
 // RenderCover 渲染 1200x630 封面卡片：渐变背景 + 细网格 + 品牌条 + 标题/副标题/标签。
+// 封面不随配图主题走，固定默认主题；与配图渲染共用色槽变量，须持锁。
 func RenderCover(in CoverInput) string {
+	svg, err := renderWithTheme(defaultThemeName, func() (string, error) {
+		return renderCover(in), nil
+	})
+	if err != nil { // 闭包不返回错误，仅为适配 renderWithTheme 签名
+		return ""
+	}
+	return svg
+}
+
+func renderCover(in CoverInput) string {
 	var b strings.Builder
 	b.WriteString(svgOpen(1200, 630))
 
