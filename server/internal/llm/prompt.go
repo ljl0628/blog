@@ -101,13 +101,165 @@ func BuildFigureRegenPrompt(title string, markdown string, figsMeta string) (sys
 输出 JSON 结构（figures 数组元素数、id、kind 必须与已有配图元信息完全一致）：
 { "figures": [ { "id": "fig-1", "kind": "与元信息一致", "title": "图标题", "data": { ... } } ] }
 
-data 按 kind 的结构与要求：
+data 按 kind 的结构与要求（data 顶层直接是该类型的字段，如 flow 的顶层就是 steps，不要再包一层类型名）：
 - architecture: { "layers": [ { "name": "层名", "nodes": ["节点名"] } ], "edges": [ { "from": "某节点名", "to": "某节点名", "label": "可选" } ] }，2~4 层，每层 2~4 个节点，edges 引用已存在的节点名。
 - flow: { "steps": [ { "name": "步骤名", "desc": "一句话说明" } ] }，3~8 步。
 - compare: { "left": { "title": "A", "points": ["..."] }, "right": { "title": "B", "points": ["..."] } }，每侧 3~5 点、每点 30 字以内。
 - timeline: { "items": [ { "time": "...", "title": "...", "desc": "一句话" } ] }，3~6 项。
 
+data 可含可选字段 "theme"（midnight 深空蓝默认 / ocean 海洋蓝 / light 浅色 / forest 森林绿），按文章气质选配整图配色。
+
 直接输出 JSON。`, title, markdown, figsMeta)
+	return system, user
+}
+
+// BuildFigureFillPrompt 构建补齐缺失配图的 system / user 提示词：
+// missingIDs 为正文中悬空的占位符 id 清单（逗号分隔），kind 由模型按上下文自选。
+func BuildFigureFillPrompt(title string, markdown string, missingIDs string) (system, user string) {
+	system = writerSystem
+	user = fmt.Sprintf(`下面是一篇技术文章，正文中部分配图占位符（形如 {{figure:fig-2}}）还没有对应的配图数据。请阅读每个占位符所在位置的上下文，为其设计一张贴合内容的配图。
+
+== 文章标题 ==
+%s
+
+== 文章正文 ==
+%s
+
+== 缺失的占位符 id 清单 ==
+%s
+
+输出 JSON 结构（figures 数组每个 id 必须取自缺失清单，不重复、不遗漏；kind 从 architecture/flow/compare/timeline 中选择最贴合内容的类型）：
+{ "figures": [ { "id": "fig-2", "kind": "flow", "title": "图标题", "data": { ... } } ] }
+
+data 按 kind 的结构与要求（data 顶层直接是该类型的字段，如 flow 的顶层就是 steps，不要再包一层类型名）：
+- architecture: { "layers": [ { "name": "层名", "nodes": ["节点名"] } ], "edges": [ { "from": "某节点名", "to": "某节点名", "label": "可选" } ] }，2~4 层，每层 2~4 个节点，edges 引用已存在的节点名。
+- flow: { "steps": [ { "name": "步骤名", "desc": "一句话说明" } ] }，3~8 步。
+- compare: { "left": { "title": "A", "points": ["..."] }, "right": { "title": "B", "points": ["..."] } }，每侧 3~5 点、每点 30 字以内。
+- timeline: { "items": [ { "time": "...", "title": "...", "desc": "一句话" } ] }，3~6 项。
+
+data 可含可选字段 "theme"（midnight 深空蓝默认 / ocean 海洋蓝 / light 浅色 / forest 森林绿），按文章气质选配整图配色。
+
+直接输出 JSON。`, title, markdown, missingIDs)
+	return system, user
+}
+
+// BuildFigureModifyPrompt 构建单张配图按指令 AI 修改的 system / user 提示词。
+// spec 为该图当前数据（JSON 文本），instruction 为用户修改指令；要求模型
+// 在现有数据基础上按指令做最小改动，而非脱离原图自由发挥。
+func BuildFigureModifyPrompt(title, markdown, figKind, figTitle, spec, instruction string) (system, user string) {
+	system = writerSystem
+	user = fmt.Sprintf(`下面是一篇技术文章中一张配图的当前数据和一个修改指令。请在现有数据的基础上按指令修改这张图的数据（保持 kind 不变），只做指令要求的改动，不要脱离原图自由发挥；title 原样保留，仅当指令明确要求改标题时才修改。
+
+== 文章标题 ==
+%s
+
+== 文章正文 ==
+%s
+
+== 配图类型 ==
+%s（当前标题：%s）
+
+== 当前图数据（JSON）==
+%s
+
+== 修改指令 ==
+%s
+
+输出 JSON 结构：
+{ "title": "图标题", "theme": "可选，配色主题", "data": { ... } }
+
+data 按 kind 的结构与要求（data 顶层直接是该类型的字段，如 flow 的顶层就是 steps，不要再包一层类型名）：
+- architecture: { "layers": [ { "name": "层名", "nodes": ["节点名"] } ], "edges": [ { "from": "某节点名", "to": "某节点名", "label": "可选" } ] }，2~4 层，每层 2~4 个节点，edges 引用已存在的节点名。
+- flow: { "steps": [ { "name": "步骤名", "desc": "一句话说明" } ] }，3~8 步。
+- compare: { "left": { "title": "A", "points": ["..."] }, "right": { "title": "B", "points": ["..."] } }，每侧 3~5 点、每点 30 字以内。
+- timeline: { "items": [ { "time": "...", "title": "...", "desc": "一句话" } ] }，3~6 项。
+
+两条硬性规则：
+1. 无论指令如何表述，输出的 data 必须保有该 kind 的完整结构与主体条目（如 flow 不得少于 3 步），绝不输出空数组或清空内容。
+2. 指令若是在指出数据缺失或有误（如"数据去哪了""流程不见了"），应依据正文内容把 data 修复补全，而不是只改标题。
+
+theme 可选顶层字段，控制整图配色背景，取值 midnight（深空蓝，默认）/ ocean（海洋蓝）/ light（浅色）/ forest（森林绿）。指令同时涉及内容与配色时才输出 theme（纯配色指令后端直接处理，到不了你这里）；仅内容指令时不要输出 theme 字段，data 数据内容原样保留。
+
+直接输出 JSON。`, title, markdown, figKind, figTitle, spec, instruction)
+	return system, user
+}
+
+// BuildFigureRebuildPrompt 构建配图数据重建的 system / user 提示词。
+// 当前图数据已损坏（主体条目为空）时使用：不传坏基线，要求模型依据
+// 正文与指令为该图全新设计一份数据，走出「在空数据上最小改动」的死局。
+func BuildFigureRebuildPrompt(title, markdown, figKind, figTitle, instruction string) (system, user string) {
+	system = writerSystem
+	user = fmt.Sprintf(`下面是一篇技术文章。其中一张配图（类型 %s，标题 %q）的数据已损坏丢失，需要你依据文章内容为它重新设计一份数据；用户指令表达了对这张图的期望，优先满足。
+
+== 文章标题 ==
+%s
+
+== 文章正文 ==
+%s
+
+== 配图类型与标题 ==
+%s（%s）
+
+== 用户指令 ==
+%s
+
+输出 JSON 结构：
+{ "title": "图标题", "data": { ... } }
+
+data 按 kind 的结构与要求（data 顶层直接是该类型的字段，如 flow 的顶层就是 steps，不要再包一层类型名）：
+- architecture: { "layers": [ { "name": "层名", "nodes": ["节点名"] } ], "edges": [ { "from": "某节点名", "to": "某节点名", "label": "可选" } ] }，2~4 层，每层 2~4 个节点，edges 引用已存在的节点名。
+- flow: { "steps": [ { "name": "步骤名", "desc": "一句话说明" } ] }，3~8 步。
+- compare: { "left": { "title": "A", "points": ["..."] }, "right": { "title": "B", "points": ["..."] } }，每侧 3~5 点、每点 30 字以内。
+- timeline: { "items": [ { "time": "...", "title": "...", "desc": "一句话" } ] }，3~6 项。
+
+title 原样保留（%q），仅当指令明确要求改标题时才修改。可选顶层字段 theme 控制整图配色背景，取值 midnight（深空蓝，默认）/ ocean（海洋蓝）/ light（浅色）/ forest（森林绿）。
+
+直接输出 JSON。`, figKind, figTitle, title, markdown, figKind, figTitle, instruction, figTitle)
+	return system, user
+}
+
+const judgeSystem = `你是一位严格的技术博客审校编辑，以挑剔的眼光对 AI 生成的技术文章做质量把关，` +
+	`打分客观、不恭维。你必须严格按用户要求的 JSON 结构输出，` +
+	`直接输出 JSON，不要包含任何解释、markdown 代码块或多余文本。评语使用中文。`
+
+// BuildJudgePrompt 构建文章质量评审（judge）阶段的 system / user 提示词。
+// markdown 为文章正文，figuresJSON 为配图 spec 数组的 JSON 文本（评配图维度用）。
+func BuildJudgePrompt(repoName, title, summary, markdown string, figuresJSON string) (system, user string) {
+	system = judgeSystem
+	user = fmt.Sprintf(`请评审下面这篇基于仓库「%s」生成的技术博客文章，按四个维度各打 1~5 分（可含一位小数），输出 JSON。
+
+== 文章标题 ==
+%s
+
+== 文章摘要 ==
+%s
+
+== 文章正文 ==
+%s
+
+== 配图 spec（与正文 {{figure:...}} 占位符对应）==
+%s
+
+评分维度：
+1. score_accuracy 准确性：技术表述与代码引用是否可信、有无编造或明显错误；
+2. score_structure 结构性：层次划分与论证逻辑是否清晰完整；
+3. score_readability 可读性：语言是否流畅、深度与目标受众适配是否得当；
+4. score_figure 配图：figures spec 与正文内容的匹配度与信息准确性。
+
+输出 JSON 结构如下：
+{
+  "score_accuracy": 4.5,
+  "score_structure": 4.0,
+  "score_readability": 4.0,
+  "score_figure": 3.5,
+  "score_total": 4.0,
+  "verdict": "pass",
+  "comment": "一句中文评语，指出最大的优点或问题，200 字以内"
+}
+
+规则：score_total = 四维分数的平均值，保留一位小数；verdict：score_total ≥ 3.5 为 "pass"，否则为 "needs_review"。
+
+直接输出 JSON。`, repoName, title, summary, markdown, figuresJSON)
 	return system, user
 }
 

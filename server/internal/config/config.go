@@ -54,11 +54,25 @@ type LLM struct {
 	Temperature    float32 `mapstructure:"temperature"`
 	MaxTokens      int     `mapstructure:"max_tokens"`
 	RatePerMinute  int     `mapstructure:"rate_per_minute"`
+	// judge 自动打分：文章生成完成后由 LLM 按四维（准确/结构/可读/配图）打质量分。
+	// bool 默认值写法同 rag.enabled——零值 false 且 applyDefaults 无法区分「未配置」
+	// 与「显式关闭」，故默认 true 由 config.yaml 显式写值保证，不在 applyDefaults 里补
+	JudgeModel   string `mapstructure:"judge_model"`   // 打分模型，空 = 复用主模型 model
+	JudgeEnabled bool   `mapstructure:"judge_enabled"` // 生成时自动打分开关，默认 true
 	// 本地调试（mode=debug）覆盖项：非空时替换对应主配置，release 不生效。
 	// 用途：本地改用免费模型跑通流水线，不消耗生成套餐额度
 	DevBaseURL   string `mapstructure:"dev_base_url"`
 	DevModel     string `mapstructure:"dev_model"`
 	DevMaxTokens int    `mapstructure:"dev_max_tokens"`
+	// 模型价目表（元 / 1k token），键=模型名；仅用于看板成本估算，空表时成本按 0。
+	// map 结构无法用环境变量覆盖，非密钥，直接写 yaml
+	Pricing map[string]LLMPrice `mapstructure:"pricing"`
+}
+
+// LLMPrice 单模型单价（元 / 1k token），用于看板成本估算。
+type LLMPrice struct {
+	Prompt     float64 `mapstructure:"prompt"`     // 输入单价
+	Completion float64 `mapstructure:"completion"` // 输出单价
 }
 
 type Auth struct {
@@ -124,6 +138,9 @@ type RAG struct {
 	RerankBaseURL    string `mapstructure:"rerank_base_url"`   // 空 = 复用 embedding_base_url
 	RerankAPIKey     string `mapstructure:"rerank_api_key"`    // 空 = 复用 embedding_api_key
 	RerankCandidates int    `mapstructure:"rerank_candidates"` // 粗排候选量，缺省 top_k×4
+	// 评测轮（RAG 回归评测 run）是否跑 judge 给每条回答打分；默认 true，
+	// 写法同 enabled——bool 默认值由 config.yaml 显式写值保证
+	EvalJudge bool `mapstructure:"eval_judge"`
 }
 
 // Load 读取指定路径的 yaml 配置。config.yaml 只放非私密配置；密钥/密码等私密项经环境变量注入。

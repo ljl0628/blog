@@ -105,6 +105,21 @@ export const Articles = observer(function Articles() {
             ),
           },
           {
+            title: '质量分',
+            dataIndex: 'review_score',
+            width: 90,
+            render: (v: number | null | undefined) =>
+              v == null ? (
+                <Tag>未评</Tag>
+              ) : (
+                <Tooltip title="点击编辑页看四维明细">
+                  <Tag color={v >= 4 ? 'green' : v >= 3 ? 'orange' : 'red'}>
+                    {Math.round(v * 100) / 100}
+                  </Tag>
+                </Tooltip>
+              ),
+          },
+          {
             title: '发布时间',
             dataIndex: 'published_at',
             width: 160,

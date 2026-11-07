@@ -49,6 +49,10 @@ func Migrate(db *gorm.DB) error {
 		&model.Article{},
 		&model.SvgAsset{},
 		&model.AskUnanswered{},
+		&model.LlmUsage{},
+		&model.RagEvalCase{},
+		&model.RagEvalRun{},
+		&model.ArticleReview{},
 	)
 }
 

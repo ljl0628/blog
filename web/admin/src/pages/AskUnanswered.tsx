@@ -1,8 +1,10 @@
 import { useCallback, useEffect, useState } from 'react';
-import { Button, DatePicker, Form, Input, Table, Typography, message } from 'antd';
-import { SearchOutlined } from '@ant-design/icons';
+import { Button, DatePicker, Form, Input, Modal, Table, Typography, message } from 'antd';
+import { ExperimentOutlined, SearchOutlined } from '@ant-design/icons';
 import type { Dayjs } from 'dayjs';
-import { get } from '../api/http';
+import { useNavigate } from 'react-router-dom';
+import { get, post } from '../api/http';
+import { ArticlePicker } from '../components/ArticleSelectModal';
 import type { AskUnanswered, PageData } from '../types';
 
 interface QueryForm {
@@ -21,6 +23,13 @@ export function AskUnansweredPage() {
   const [keyword, setKeyword] = useState('');
   const [range, setRange] = useState<[Dayjs, Dayjs] | null>(null);
   const [form] = Form.useForm<QueryForm>();
+  const navigate = useNavigate();
+
+  // 转评测弹窗：目标问题 + 期望文章（ArticlePicker 选择）
+  const [transferOpen, setTransferOpen] = useState(false);
+  const [transferTarget, setTransferTarget] = useState<AskUnanswered | null>(null);
+  const [transferIds, setTransferIds] = useState<number[]>([]);
+  const [transferring, setTransferring] = useState(false);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -59,6 +68,43 @@ export function AskUnansweredPage() {
     setPage(1);
   };
 
+  // 打开转评测弹窗：清空上次输入，避免误带旧值提交
+  const openTransfer = (record: AskUnanswered) => {
+    setTransferTarget(record);
+    setTransferIds([]);
+    setTransferOpen(true);
+  };
+
+  // 导入为评测用例：期望文章由弹窗选择；成功后可选跳转评测页
+  const onTransfer = async () => {
+    if (!transferTarget) return;
+    if (!transferIds.length) {
+      message.warning('请至少选择一篇期望文章');
+      return;
+    }
+    const expectIds = transferIds;
+    setTransferring(true);
+    try {
+      await post<void>('/rag-eval/cases/import-unanswered', {
+        unanswered_id: transferTarget.id,
+        expect_article_ids: expectIds,
+      });
+      setTransferOpen(false);
+      message.success('已导入评测集');
+      Modal.confirm({
+        title: '该问题已转为评测用例',
+        content: '是否前往 RAG 评测页查看？',
+        okText: '前往评测页',
+        cancelText: '留在本页',
+        onOk: () => navigate('/rag-eval'),
+      });
+    } catch (e) {
+      message.error((e as Error).message || '导入失败');
+    } finally {
+      setTransferring(false);
+    }
+  };
+
   const columns = [
     {
       title: '提问次数',
@@ -78,6 +124,21 @@ export function AskUnansweredPage() {
       dataIndex: 'last_seen_at',
       width: 170,
       render: (v: string) => (v ? new Date(v).toLocaleString() : '-'),
+    },
+    {
+      title: '操作',
+      key: 'action',
+      width: 100,
+      render: (_: unknown, record: AskUnanswered) => (
+        <Button
+          type="link"
+          size="small"
+          icon={<ExperimentOutlined />}
+          onClick={() => openTransfer(record)}
+        >
+          转评测
+        </Button>
+      ),
     },
   ];
 
@@ -118,6 +179,26 @@ export function AskUnansweredPage() {
           },
         }}
       />
+
+      {/* 转评测弹窗：问题只读展示，仅需补期望文章 ID */}
+      <Modal
+        open={transferOpen}
+        title="转为评测用例"
+        okText="导入评测集"
+        cancelText="取消"
+        confirmLoading={transferring}
+        onOk={() => void onTransfer()}
+        onCancel={() => setTransferOpen(false)}
+      >
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 4 }}>
+          问题
+        </Typography.Paragraph>
+        <Typography.Paragraph>{transferTarget?.question}</Typography.Paragraph>
+        <Typography.Paragraph type="secondary" style={{ marginBottom: 4 }}>
+          期望文章
+        </Typography.Paragraph>
+        <ArticlePicker value={transferIds} onChange={setTransferIds} />
+      </Modal>
     </div>
   );
 }

@@ -47,13 +47,15 @@ type App struct {
 	srv       *http.Server
 
 	// 跨步骤共享的业务组件：initPipeline / initServices 构造，initMQ / initHTTP 使用
-	llmClient  *llm.Client
-	pipeline   *task.Pipeline
-	ragSvc     *service.RagService
-	authSvc    *service.AuthService
-	taskSvc    *service.TaskService
-	articleSvc *service.ArticleService
-	portalSvc  *service.PortalService
+	llmClient   *llm.Client
+	pipeline    *task.Pipeline
+	ragSvc      *service.RagService
+	authSvc     *service.AuthService
+	taskSvc     *service.TaskService
+	articleSvc  *service.ArticleService
+	portalSvc   *service.PortalService
+	metricsSvc  *service.MetricsService
+	ragEvalSvc  *service.RagEvalService
 }
 
 // New 创建应用（不立即做任何 I/O，装配在 Run/bootstrap 中进行）。
@@ -111,13 +113,16 @@ func (a *App) Run() int {
 	return exitCode
 }
 
-// shutdown 优雅停机：停 HTTP → 取消全局 ctx → 等 consumer 退出 → 关 MQ。
+// shutdown 优雅停机：停 HTTP → 打断 RAG 评测轮 → 取消全局 ctx → 等 consumer 退出 → 关 MQ。
 func (a *App) shutdown(ctx context.Context, stop context.CancelFunc, consumerDone <-chan struct{}) {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), httpShutdownTimeout)
 	defer cancel()
 	if err := a.srv.Shutdown(shutdownCtx); err != nil {
 		a.log.Warn("HTTP 停机超时/出错", zap.Error(err))
 	}
+	// 打断进行中的 RAG 评测轮：评测 goroutine 用独立 ctx（不随全局 ctx 取消），
+	// 需显式 Stop；被中断的轮自行落为 failed 并保留已跑明细
+	a.ragEvalSvc.Stop()
 	stop() // 取消全局 ctx，consumer 退出循环
 
 	select {

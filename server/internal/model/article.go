@@ -24,6 +24,7 @@ type Article struct {
 	LikeCount      int            `gorm:"not null;default:0" json:"like_count"`
 	Tags           JSON           `json:"tags" swaggertype:"array,string"`
 	Status         ArticleStatus  `gorm:"size:16;index;default:draft" json:"status"`
+	ReviewScore    *float64       `gorm:"index" json:"review_score"` // 最新评审总分，null=未评，落 review 时覆盖——审核列表实际查询字段
 	SortOrder      int            `json:"sort_order"`
 	CoverAssetID   *uint          `json:"cover_asset_id"`
 	PublishedAt    *time.Time     `json:"published_at"`

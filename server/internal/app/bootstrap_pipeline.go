@@ -11,10 +11,10 @@ import (
 
 // initPipeline 组装 LLM 客户端、RAG 组件与生成任务流水线。
 func (a *App) initPipeline(context.Context) error {
-	a.llmClient = llm.NewClient(a.cfg.LLM, a.rdb, a.log)
+	a.llmClient = llm.NewClient(a.cfg.LLM, a.rdb, a.db, a.log)
 	// RAG 技术问答组件：embedding 客户端 + 可选 rerank 精排 + Qdrant 向量库
 	// （rag.enabled=false 时服务自身不可用）
-	embedder := llm.NewEmbedder(a.cfg.RAG, a.cfg.LLM, a.log)
+	embedder := llm.NewEmbedder(a.cfg.RAG, a.cfg.LLM, a.db, a.log)
 	reranker := llm.NewReranker(a.cfg.RAG, a.cfg.LLM, a.log) // rerank_enabled=false 时为 nil
 	store := qdrant.New(a.cfg.Qdrant.BaseURL, a.cfg.Qdrant.Collection, a.log)
 	// 问答面向公众、调用量大：单独配免费模型，不消耗主模型（生成套餐）额度
@@ -23,7 +23,15 @@ func (a *App) initPipeline(context.Context) error {
 		chatClient = qa
 	}
 	a.ragSvc = service.NewRagService(a.db, chatClient, embedder, reranker, store, a.cfg.RAG, a.log)
-	a.pipeline = task.New(*a.cfg, a.db, a.rdb, a.llmClient, a.log)
+	// judge 自动打分客户端：judge_model 留空或与主模型相同 → 复用主客户端；
+	// 否则以主模型配置为底、仅替换模型名独立构造（llm_usage 按模型名分别记账）
+	judgeClient := a.llmClient
+	if jm := a.cfg.LLM.JudgeModel; jm != "" && jm != a.cfg.LLM.Model {
+		jc := a.cfg.LLM
+		jc.Model = jm
+		judgeClient = llm.NewClient(jc, a.rdb, a.db, a.log)
+	}
+	a.pipeline = task.New(*a.cfg, a.db, a.rdb, a.llmClient, judgeClient, a.log)
 	return nil
 }
 
@@ -44,5 +52,5 @@ func (a *App) ragChatClient() *llm.Client {
 	c.Model = r.ChatModel
 	c.MaxTokens = r.ChatMaxTokens // applyDefaults 已保证非零
 	c.TimeoutSeconds = 120        // 单轮问答无需主模型的 600s 长超时
-	return llm.NewClient(c, a.rdb, a.log)
+	return llm.NewClient(c, a.rdb, a.db, a.log)
 }

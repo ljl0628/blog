@@ -28,16 +28,17 @@ import (
 
 // Pipeline 聚合流水线依赖。
 type Pipeline struct {
-	cfg config.Config
-	db  *gorm.DB
-	rdb *redis.Client
-	llm *llm.Client
-	log *zap.Logger
+	cfg   config.Config
+	db    *gorm.DB
+	rdb   *redis.Client
+	llm   *llm.Client
+	judge *llm.Client // 质量评审客户端：judge_model 留空时与主 client 同引用
+	log   *zap.Logger
 }
 
-// New 创建流水线。
-func New(cfg config.Config, db *gorm.DB, rdb *redis.Client, client *llm.Client, log *zap.Logger) *Pipeline {
-	return &Pipeline{cfg: cfg, db: db, rdb: rdb, llm: client, log: log}
+// New 创建流水线。judge 为质量评审客户端，judge_model 留空时与 client 同引用。
+func New(cfg config.Config, db *gorm.DB, rdb *redis.Client, client, judge *llm.Client, log *zap.Logger) *Pipeline {
+	return &Pipeline{cfg: cfg, db: db, rdb: rdb, llm: client, judge: judge, log: log}
 }
 
 // Handle 执行一次完整生成流程。失败返回错误（由 MQ 决定重投/死信）；
@@ -150,6 +151,12 @@ func (p *Pipeline) Handle(ctx context.Context, taskID uint) error {
 			return p.fail(ctx, prog, taskID, fmt.Errorf("保存配图「%s」: %w", art.Title, err))
 		}
 		prog.logf("文章已入库：《%s》（%d 字，配图 %d 张）", art.Title, art.WordCount, len(artOut.Figures))
+		// judge 自动打分（llm.judge_enabled=false 整段跳过）：失败只告警，不影响任务成功
+		if p.cfg.LLM.JudgeEnabled {
+			if jo := p.judgeArticle(ctx, art, string(jsonify(artOut.Figures))); jo != nil {
+				prog.logf("质量评审：%.1f/5（%s）", jo.ScoreTotal, jo.Verdict)
+			}
+		}
 		done++
 	}
 
@@ -167,7 +174,7 @@ func (p *Pipeline) Handle(ctx context.Context, taskID uint) error {
 func (p *Pipeline) analyzeRepo(ctx context.Context, digest string) (*llm.AnalysisOut, error) {
 	system, user := llm.BuildAnalysisPrompt(digest, p.cfg.Task.ArticleCount)
 	var out llm.AnalysisOut
-	err := p.llm.ChatJSON(ctx, system, user, &out, func() error {
+	err := p.llm.ChatJSON(ctx, model.LlmSceneAnalyze, system, user, &out, func() error {
 		if len(out.ArticlePlan) == 0 {
 			return errors.New("article_plan 不能为空")
 		}
@@ -183,7 +190,7 @@ const minArticleWords = 1000
 func (p *Pipeline) writeArticle(ctx context.Context, repoName string, analysisJSON []byte, plan llm.ArticlePlanOut) (*llm.ArticleOut, error) {
 	system, user := llm.BuildArticlePrompt(repoName, string(analysisJSON), string(jsonify(plan)))
 	var out llm.ArticleOut
-	err := p.llm.ChatJSON(ctx, system, user, &out, func() error {
+	err := p.llm.ChatJSON(ctx, model.LlmSceneWriteArticle, system, user, &out, func() error {
 		if strings.TrimSpace(out.Title) == "" {
 			return errors.New("title 不能为空")
 		}
@@ -219,6 +226,70 @@ func (p *Pipeline) writeArticle(ctx context.Context, repoName string, analysisJS
 		return nil
 	})
 	return &out, err
+}
+
+// judgeArticle 调用 LLM 对成稿文章做四维质量评审（scene=judge），落 ArticleReview
+// 并覆盖 article.review_score。评审是增强项而非产出项：任何失败仅记 Warn 并返回
+// nil，不影响任务成功（与 SVG 渲染失败跳过同一哲学）。
+func (p *Pipeline) judgeArticle(ctx context.Context, art *model.Article, figuresJSON string) *llm.JudgeOut {
+	// 仓库名只用于给评审提供语境，查不到时降级为空串，不阻塞评审
+	var ra model.RepoAnalysis
+	repoName := ""
+	if err := p.db.WithContext(ctx).Select("repo_name").First(&ra, art.RepoAnalysisID).Error; err == nil {
+		repoName = ra.RepoName
+	}
+
+	system, user := llm.BuildJudgePrompt(repoName, art.Title, art.Summary, art.ContentMD, figuresJSON)
+	var out llm.JudgeOut
+	err := p.judge.ChatJSON(ctx, model.LlmSceneJudge, system, user, &out, func() error {
+		for _, d := range []struct {
+			name  string
+			score float64
+		}{
+			{"score_accuracy", out.ScoreAccuracy},
+			{"score_structure", out.ScoreStructure},
+			{"score_readability", out.ScoreReadability},
+			{"score_figure", out.ScoreFigure},
+			{"score_total", out.ScoreTotal},
+		} {
+			if d.score < 1 || d.score > 5 {
+				return fmt.Errorf("%s=%g 非法：分数必须在 1~5 之间", d.name, d.score)
+			}
+		}
+		if out.Verdict != string(model.ReviewVerdictPass) && out.Verdict != string(model.ReviewVerdictNeedsReview) {
+			return fmt.Errorf("verdict=%s 非法：只能是 pass 或 needs_review", out.Verdict)
+		}
+		if n := len([]rune(out.Comment)); n > 512 {
+			return fmt.Errorf("comment 长度 %d 字超出 512 字上限，请精简评语", n)
+		}
+		return nil
+	})
+	if err != nil {
+		p.log.Warn("文章质量评审失败，跳过", zap.Uint("article_id", art.ID), zap.Error(err))
+		return nil
+	}
+
+	review := &model.ArticleReview{
+		ArticleID:        art.ID,
+		ScoreTotal:       out.ScoreTotal,
+		ScoreAccuracy:    out.ScoreAccuracy,
+		ScoreStructure:   out.ScoreStructure,
+		ScoreReadability: out.ScoreReadability,
+		ScoreFigure:      out.ScoreFigure,
+		Verdict:          model.ReviewVerdict(out.Verdict),
+		JudgeModel:       p.judge.ModelName(),
+		Comment:          out.Comment,
+	}
+	if err := p.db.WithContext(ctx).Create(review).Error; err != nil {
+		p.log.Warn("评审记录落库失败", zap.Uint("article_id", art.ID), zap.Error(err))
+		return nil
+	}
+	// 覆盖文章最新总分；历史评审记录保留在 article_review 表
+	if err := p.db.WithContext(ctx).Model(&model.Article{}).
+		Where("id = ?", art.ID).Update("review_score", out.ScoreTotal).Error; err != nil {
+		p.log.Warn("回写文章评审总分失败", zap.Uint("article_id", art.ID), zap.Error(err))
+	}
+	return &out
 }
 
 // saveArticle 按 slug upsert 文章（重跑安全）：存在则覆盖内容并回到 draft，
@@ -316,6 +387,8 @@ func (p *Pipeline) cleanupPreviousDrafts(ctx context.Context, taskID uint, prog 
 		return
 	}
 	p.db.WithContext(ctx).Where("article_id IN ?", ids).Delete(&model.SvgAsset{})
+	// 草稿被删，其评审记录一并清理，避免 article_review 残留指向已删文章的孤儿行
+	p.db.WithContext(ctx).Where("article_id IN ?", ids).Delete(&model.ArticleReview{})
 	if err := p.db.WithContext(ctx).Where("id IN ?", ids).Delete(&model.Article{}).Error; err != nil {
 		p.log.Warn("清理历史草稿失败", zap.Uint("task_id", taskID), zap.Error(err))
 		return

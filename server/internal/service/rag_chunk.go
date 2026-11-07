@@ -6,8 +6,9 @@ import (
 	"unicode/utf8"
 )
 
-// figurePlaceholderRe 匹配正文中 {{figure:xxx}} 配图占位符（向量检索不需要图片语法）。
-var figurePlaceholderRe = regexp.MustCompile(`\{\{figure:[^}]*\}\}`)
+// figurePlaceholderRe 匹配正文中 {{figure:xxx}} 配图占位符并捕获 id
+// （向量检索时整体剔除；配图校验/补齐时取捕获组比对已有配图）。
+var figurePlaceholderRe = regexp.MustCompile(`\{\{figure:([^}]*)\}\}`)
 
 // htmlCommentRe 匹配同一行内完整的 HTML 注释。
 var htmlCommentRe = regexp.MustCompile(`<!--.*?-->`)

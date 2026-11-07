@@ -1,5 +1,18 @@
 import { useEffect, useState } from 'react';
-import { Button, Card, Col, Form, Input, Popconfirm, Row, Space, Tag, message } from 'antd';
+import {
+  Button,
+  Card,
+  Col,
+  Form,
+  Input,
+  Popconfirm,
+  Row,
+  Space,
+  Statistic,
+  Tag,
+  Typography,
+  message,
+} from 'antd';
 import {
   ArrowLeftOutlined,
   CloudUploadOutlined,
@@ -9,8 +22,11 @@ import {
 } from '@ant-design/icons';
 import { useNavigate, useParams } from 'react-router-dom';
 import { observer } from 'mobx-react-lite';
+import dayjs from 'dayjs';
 import { articleStore } from '../stores';
+import { get } from '../api/http';
 import { ARTICLE_STATUS_TEXT } from '../types';
+import type { ArticleReview } from '../types';
 import { MarkdownPreview } from '../components/MarkdownPreview';
 import { FigureList } from '../components/FigureList';
 import { ArticleMetaForm } from '../components/ArticleMetaForm';
@@ -21,6 +37,8 @@ export const ArticleEdit = observer(function ArticleEdit() {
   const navigate = useNavigate();
   const [form] = Form.useForm<ArticleMetaValues>();
   const [contentMd, setContentMd] = useState('');
+  // 最新质量评审（有 review_score 才拉取并展示评分卡）
+  const [review, setReview] = useState<ArticleReview | null>(null);
 
   const articleId = Number(id);
   const current = articleStore.current;
@@ -39,6 +57,30 @@ export const ArticleEdit = observer(function ArticleEdit() {
       setContentMd(current?.content_md ?? '');
     }
   }, [isCurrent, current?.id]);
+
+  // 文章带质量分时拉评审明细取最新一条；失败不打断编辑，仅不展示评分卡
+  useEffect(() => {
+    if (!isCurrent || current?.review_score == null) {
+      setReview(null);
+      return;
+    }
+    let cancelled = false;
+    get<ArticleReview[]>(`/articles/${articleId}/reviews`)
+      .then((list) => {
+        if (cancelled) return;
+        const latest = [...(list ?? [])].sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime(),
+        )[0];
+        setReview(latest ?? null);
+      })
+      .catch(() => {
+        if (!cancelled) setReview(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [isCurrent, current?.review_score, articleId]);
 
   const onRegenerate = async () => {
     const hide = message.loading('正在重新生成配图（调用 LLM + 渲染），请稍候...', 0);
@@ -150,6 +192,71 @@ export const ArticleEdit = observer(function ArticleEdit() {
         loading={!isCurrent && articleStore.detailLoading}
       />
 
+      {/* 质量评审卡：总分大字 + 结论 + 四维明细 + 评语；仅有评审记录的文章显示 */}
+      {review && (
+        <Card
+          size="small"
+          style={{ marginTop: 16 }}
+          title="质量评审"
+          extra={
+            <Typography.Text type="secondary">
+              {review.judge_model} ·{' '}
+              {dayjs(review.created_at).format('YYYY-MM-DD HH:mm')}
+            </Typography.Text>
+          }
+        >
+          <Row gutter={24} align="middle">
+            <Col xs={24} sm={6} md={4} style={{ textAlign: 'center' }}>
+              <div
+                style={{
+                  fontSize: 40,
+                  fontWeight: 700,
+                  lineHeight: 1.2,
+                  color:
+                    review.score_total >= 4
+                      ? '#389e0d'
+                      : review.score_total >= 3
+                        ? '#d46b08'
+                        : '#cf1322',
+                }}
+              >
+                {review.score_total}
+              </div>
+              <Tag
+                color={review.verdict === 'pass' ? 'success' : 'warning'}
+                style={{ marginTop: 8 }}
+              >
+                {review.verdict === 'pass' ? '通过' : '需复核'}
+              </Tag>
+            </Col>
+            <Col xs={24} sm={18} md={20}>
+              <Row gutter={16}>
+                <Col xs={12} md={6}>
+                  <Statistic title="准确" value={review.score_accuracy} suffix="/ 5" />
+                </Col>
+                <Col xs={12} md={6}>
+                  <Statistic title="结构" value={review.score_structure} suffix="/ 5" />
+                </Col>
+                <Col xs={12} md={6}>
+                  <Statistic title="可读性" value={review.score_readability} suffix="/ 5" />
+                </Col>
+                <Col xs={12} md={6}>
+                  <Statistic title="配图" value={review.score_figure} suffix="/ 5" />
+                </Col>
+              </Row>
+              {review.comment && (
+                <Typography.Paragraph
+                  type="secondary"
+                  style={{ marginTop: 12, marginBottom: 0 }}
+                >
+                  {review.comment}
+                </Typography.Paragraph>
+              )}
+            </Col>
+          </Row>
+        </Card>
+      )}
+
       <Row gutter={16}>
         <Col xs={24} lg={12}>
           <Card title="Markdown 正文" size="small">
@@ -170,10 +277,7 @@ export const ArticleEdit = observer(function ArticleEdit() {
       </Row>
 
       <Card title="配图预览" size="small" style={{ marginTop: 16 }}>
-        <FigureList
-          figures={isCurrent ? current.figures : []}
-          loading={!isCurrent && articleStore.detailLoading}
-        />
+        <FigureList figures={isCurrent ? current.figures : []} loading={!isCurrent && articleStore.detailLoading} />
       </Card>
     </div>
   );

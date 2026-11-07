@@ -149,7 +149,7 @@ func (s *RagService) rewriteQuery(ctx context.Context, question string, history 
 	var out struct {
 		Question string `json:"question"`
 	}
-	if err := s.chat.ChatJSON(ctx, rewriteSystemPrompt,
+	if err := s.chat.ChatJSON(ctx, model.LlmSceneRagChat, rewriteSystemPrompt,
 		b.String()+"用户最新问题: "+question, &out, nil); err != nil {
 		return "", err
 	}
@@ -159,6 +159,13 @@ func (s *RagService) rewriteQuery(ctx context.Context, question string, history 
 // Ask 检索相关片段并流式生成回答：每段增量文本回调 onDelta，
 // 返回本次回答引用的文章出处。history 携带最近几轮对话上下文（可空）。
 func (s *RagService) Ask(ctx context.Context, question string, history []Turn, onDelta func(string)) ([]Citation, error) {
+	return s.ask(ctx, question, history, onDelta, true)
+}
+
+// ask Ask 的实现；captureUnanswered 控制无命中时是否把问题落库 ask_unanswered。
+// 回归评测（rag_eval.go）复用完整问答链但传 false——评测重放不该推高
+// 选题回流统计里「用户真实提问」的计数。
+func (s *RagService) ask(ctx context.Context, question string, history []Turn, onDelta func(string), captureUnanswered bool) ([]Citation, error) {
 	question = strings.TrimSpace(question)
 	if question == "" {
 		return nil, fmt.Errorf("%w: 问题不能为空", ErrInvalid)
@@ -182,92 +189,24 @@ func (s *RagService) Ask(ctx context.Context, question string, history []Turn, o
 		cancel()
 	}
 
-	// 1. 问题向量化 + 粗排检索（rerank 开启时多捞候选供精排筛选）
-	vecs, err := s.embedder.Embed(ctx, []string{searchQuery})
+	// 1. 检索链（retrieve）：与回归评测（rag_eval.go）共用同一条链，口径一致
+	hits, queryVec, err := s.retrieve(ctx, searchQuery)
 	if err != nil {
-		return nil, fmt.Errorf("问题向量化失败: %w", err)
-	}
-	limit := s.cfg.TopK
-	if s.reranker != nil && s.cfg.RerankCandidates > limit {
-		limit = s.cfg.RerankCandidates
-	}
-	hits, err := s.store.Search(ctx, vecs[0], limit)
-	if err != nil {
-		return nil, fmt.Errorf("向量检索失败: %w", err)
-	}
-	// 阈值过滤在 rerank 之前：阈值口径是向量余弦分，rerank 分数分布不同不可比；
-	// 先过滤再精排还能用更深的候选把被噪声占掉的 top_k 名额补满
-	kept := hits[:0]
-	for _, h := range hits {
-		if h.Score >= s.cfg.ScoreThreshold {
-			kept = append(kept, h)
-		}
-	}
-	hits = kept
-
-	// rerank 精排：交叉编码器重排候选；失败降级为向量序（可用性优先于精度）
-	if s.reranker != nil && len(hits) > 1 {
-		docs := make([]string, len(hits))
-		for i, h := range hits {
-			// 与索引向量化同构的输入：话题前缀 + 块正文，交叉编码器看到同样的锚点
-			docs[i] = (IndexedChunk{Content: h.Content, TitlePath: h.TitlePath}).EmbedInput(h.Title)
-		}
-		res, err := s.reranker.Rerank(ctx, searchQuery, docs)
-		if err != nil {
-			s.log.Warn("rerank 失败，降级为向量序", zap.Error(err))
-		} else {
-			reordered := make([]qdrant.SearchHit, 0, len(hits))
-			returned := make([]bool, len(hits))
-			for _, r := range res {
-				if r.Index < len(hits) && !returned[r.Index] {
-					reordered = append(reordered, hits[r.Index])
-					returned[r.Index] = true
-				}
-			}
-			for i, h := range hits { // provider 少回结果时未覆盖的候选按原序补尾，防丢
-				if !returned[i] {
-					reordered = append(reordered, h)
-				}
-			}
-			hits = reordered
-		}
-	}
-	// 引用分仍用向量分（与阈值同口径、前端展示语义不变），rerank 只改排序
-	if len(hits) > s.cfg.TopK {
-		hits = hits[:s.cfg.TopK]
+		return nil, err
 	}
 
-	// 按文章分组：同一文章的多个命中块合并进同一组上下文，「资料来源」每篇只出一条。
-	// 分组必须在组装上下文时完成而非前端展示层去重——正文 [n] 标注引用的是分组后的
-	// 文章序号，展示层去重会让 [3] 指向列表里不存在的条目。
-	// hits 按得分降序，每组首个块即组内最高分，其摘要与得分代表该文章。
-	type hitContent struct{ path, text string }
-	type articleGroup struct {
-		slug     string
-		title    string
-		score    float32
-		contents []hitContent
-	}
-	groups := make([]*articleGroup, 0, len(hits))
-	bySlug := make(map[string]*articleGroup, len(hits))
-	for _, h := range hits {
-		if h.Score < s.cfg.ScoreThreshold {
-			continue // 低于阈值的命中视为噪声
-		}
-		g, ok := bySlug[h.Slug]
-		if !ok {
-			g = &articleGroup{slug: h.Slug, title: h.Title, score: h.Score}
-			bySlug[h.Slug] = g
-			groups = append(groups, g)
-		}
-		g.contents = append(g.contents, hitContent{path: h.TitlePath, text: h.Content})
-	}
+	// 按文章分组（groupByArticle）：同一文章的多个命中块合并进同一组上下文，
+	// 「资料来源」每篇只出一条。分组必须在组装上下文时完成而非前端展示层去重——
+	// 正文 [n] 标注引用的是分组后的文章序号，展示层去重会让 [3] 指向列表里不存在的条目。
+	groups := groupByArticle(hits, s.cfg.ScoreThreshold)
 
 	// 2. 无相关内容：不调 LLM，直接给固定话术（省 token 且不编造）；
 	//    问题顺手落库供选题回流——落库用原始问题（选题回流看用户真实问了什么，
-	//    不是改写后的检索串），vecs[0] 是检索时已算好的向量，白拿不重算
+	//    不是改写后的检索串），queryVec 是检索时已算好的向量，白拿不重算
 	if len(groups) == 0 {
-		s.CaptureUnanswered(ctx, question, vecs[0])
+		if captureUnanswered {
+			s.CaptureUnanswered(ctx, question, queryVec)
+		}
 		onDelta("暂未在博客文章中找到与该问题相关的内容，换个问法或浏览文章列表试试。")
 		return nil, nil
 	}
@@ -312,10 +251,104 @@ func (s *RagService) Ask(ctx context.Context, question string, history []Turn, o
 		"参考文章片段：\n%s\n\n用户问题：%s", ctxParts.String(), question)})
 
 	// 4. 流式生成
-	if err := s.chat.StreamChat(ctx, msgs, onDelta); err != nil {
+	if err := s.chat.StreamChat(ctx, model.LlmSceneRagChat, msgs, onDelta); err != nil {
 		return nil, fmt.Errorf("生成回答失败: %w", err)
 	}
 	return citations, nil
+}
+
+// retrieve 检索链：问题向量化 → 粗排检索（rerank 开启时多捞候选供精排筛选）
+// → 阈值过滤 → rerank 精排（失败降级向量序）→ top_k 截断。
+// ask 与回归评测（rag_eval.go）共用同一条链，保证线上问答与评测口径完全一致；
+// 返回最终命中（按得分降序）与问题向量（无命中落库等场景复用，白拿不重算）。
+func (s *RagService) retrieve(ctx context.Context, query string) ([]qdrant.SearchHit, []float32, error) {
+	vecs, err := s.embedder.Embed(ctx, []string{query})
+	if err != nil {
+		return nil, nil, fmt.Errorf("问题向量化失败: %w", err)
+	}
+	limit := s.cfg.TopK
+	if s.reranker != nil && s.cfg.RerankCandidates > limit {
+		limit = s.cfg.RerankCandidates
+	}
+	hits, err := s.store.Search(ctx, vecs[0], limit)
+	if err != nil {
+		return nil, nil, fmt.Errorf("向量检索失败: %w", err)
+	}
+	// 阈值过滤在 rerank 之前：阈值口径是向量余弦分，rerank 分数分布不同不可比；
+	// 先过滤再精排还能用更深的候选把被噪声占掉的 top_k 名额补满
+	kept := hits[:0]
+	for _, h := range hits {
+		if h.Score >= s.cfg.ScoreThreshold {
+			kept = append(kept, h)
+		}
+	}
+	hits = kept
+
+	// rerank 精排：交叉编码器重排候选；失败降级为向量序（可用性优先于精度）
+	if s.reranker != nil && len(hits) > 1 {
+		docs := make([]string, len(hits))
+		for i, h := range hits {
+			// 与索引向量化同构的输入：话题前缀 + 块正文，交叉编码器看到同样的锚点
+			docs[i] = (IndexedChunk{Content: h.Content, TitlePath: h.TitlePath}).EmbedInput(h.Title)
+		}
+		res, err := s.reranker.Rerank(ctx, query, docs)
+		if err != nil {
+			s.log.Warn("rerank 失败，降级为向量序", zap.Error(err))
+		} else {
+			reordered := make([]qdrant.SearchHit, 0, len(hits))
+			returned := make([]bool, len(hits))
+			for _, r := range res {
+				if r.Index < len(hits) && !returned[r.Index] {
+					reordered = append(reordered, hits[r.Index])
+					returned[r.Index] = true
+				}
+			}
+			for i, h := range hits { // provider 少回结果时未覆盖的候选按原序补尾，防丢
+				if !returned[i] {
+					reordered = append(reordered, h)
+				}
+			}
+			hits = reordered
+		}
+	}
+	// 引用分仍用向量分（与阈值同口径、前端展示语义不变），rerank 只改排序
+	if len(hits) > s.cfg.TopK {
+		hits = hits[:s.cfg.TopK]
+	}
+	return hits, vecs[0], nil
+}
+
+// hitContent 检索命中块进入文章分组后的正文条目（章节路径 + 块文本）。
+type hitContent struct{ path, text string }
+
+// articleGroup 同一文章全部命中块的分组：ask 组装回答上下文与
+// 回归评测取 top-k 文章集（judge 上下文）共用。
+type articleGroup struct {
+	slug     string
+	title    string
+	score    float32
+	contents []hitContent
+}
+
+// groupByArticle 按文章 slug 分组命中（同篇多块并入同组），组序 = 首遇顺序；
+// hits 按得分降序时每组首个块即组内最高分，其摘要与得分代表该文章。
+// 低于阈值的命中视为噪声丢弃（检索链已过滤，此处防御性同口径保留）。
+func groupByArticle(hits []qdrant.SearchHit, threshold float32) []*articleGroup {
+	groups := make([]*articleGroup, 0, len(hits))
+	bySlug := make(map[string]*articleGroup, len(hits))
+	for _, h := range hits {
+		if h.Score < threshold {
+			continue // 低于阈值的命中视为噪声
+		}
+		g, ok := bySlug[h.Slug]
+		if !ok {
+			g = &articleGroup{slug: h.Slug, title: h.Title, score: h.Score}
+			bySlug[h.Slug] = g
+			groups = append(groups, g)
+		}
+		g.contents = append(g.contents, hitContent{path: h.TitlePath, text: h.Content})
+	}
+	return groups
 }
 
 // RelatedCandidate 相关文章候选：文章 slug 与其最高块相似度。

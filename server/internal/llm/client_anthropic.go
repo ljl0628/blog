@@ -18,8 +18,9 @@ import (
 	"strings"
 )
 
-// chatOnce 按端点类型分发到对应协议实现。
-func (c *Client) chatOnce(ctx context.Context, messages []Message) (string, error) {
+// chatOnce 按端点类型分发到对应协议实现；
+// 返回的 usageInfo 来自响应 usage 字段（见各协议实现）。
+func (c *Client) chatOnce(ctx context.Context, messages []Message) (string, usageInfo, error) {
 	if c.isAnthropic() {
 		return c.chatOnceAnthropic(ctx, messages)
 	}
@@ -34,7 +35,8 @@ func (c *Client) isAnthropic() bool {
 // chatOnceAnthropic 调用 Anthropic Messages 协议 /v1/messages：
 // system 消息提取为顶层 system 参数，不支持 response_format，
 // 结构化输出由 ChatJSON 的 JSON 提取与校验重试兜底。
-func (c *Client) chatOnceAnthropic(ctx context.Context, messages []Message) (string, error) {
+// 返回的 usageInfo 来自响应 usage 字段（input/output_tokens），缺失时为零值。
+func (c *Client) chatOnceAnthropic(ctx context.Context, messages []Message) (string, usageInfo, error) {
 	var systemParts []string
 	msgs := make([]Message, 0, len(messages))
 	for _, m := range messages {
@@ -57,12 +59,12 @@ func (c *Client) chatOnceAnthropic(ctx context.Context, messages []Message) (str
 	}
 	payload, err := json.Marshal(body)
 	if err != nil {
-		return "", err
+		return "", usageInfo{}, err
 	}
 	url := strings.TrimSuffix(c.cfg.BaseURL, "/") + "/v1/messages"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return "", err
+		return "", usageInfo{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("x-api-key", c.cfg.APIKey)
@@ -70,27 +72,31 @@ func (c *Client) chatOnceAnthropic(ctx context.Context, messages []Message) (str
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return "", err
+		return "", usageInfo{}, err
 	}
 	defer resp.Body.Close()
 
 	raw, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return "", fmt.Errorf("读取响应失败(HTTP %d): %w", resp.StatusCode, err)
+		return "", usageInfo{}, fmt.Errorf("读取响应失败(HTTP %d): %w", resp.StatusCode, err)
 	}
 	// 非 200 时也尝试从响应体解析 error 信息，便于定位 401/404/429 等问题
 	var ar anthropicResponse
 	if err := json.Unmarshal(raw, &ar); err != nil && resp.StatusCode == http.StatusOK {
-		return "", fmt.Errorf("响应解析失败: %w", err)
+		return "", usageInfo{}, fmt.Errorf("响应解析失败: %w", err)
+	}
+	var usage usageInfo // 响应不含 usage 字段时保持零值
+	if ar.Usage != nil {
+		usage = usageInfo{Prompt: ar.Usage.InputTokens, Completion: ar.Usage.OutputTokens}
 	}
 	if resp.StatusCode != http.StatusOK {
 		if ar.Error != nil {
-			return "", fmt.Errorf("接口返回 HTTP %d: %s", resp.StatusCode, ar.Error.Message)
+			return "", usage, fmt.Errorf("接口返回 HTTP %d: %s", resp.StatusCode, ar.Error.Message)
 		}
-		return "", fmt.Errorf("接口返回 HTTP %d: %s", resp.StatusCode, snippet(string(raw)))
+		return "", usage, fmt.Errorf("接口返回 HTTP %d: %s", resp.StatusCode, snippet(string(raw)))
 	}
 	if ar.Error != nil {
-		return "", fmt.Errorf("接口返回错误: %s", ar.Error.Message)
+		return "", usage, fmt.Errorf("接口返回错误: %s", ar.Error.Message)
 	}
 	var b strings.Builder
 	for _, blk := range ar.Content {
@@ -101,9 +107,9 @@ func (c *Client) chatOnceAnthropic(ctx context.Context, messages []Message) (str
 	}
 	content := strings.TrimSpace(b.String())
 	if content == "" {
-		return "", errors.New("响应内容为空")
+		return "", usage, errors.New("响应内容为空")
 	}
-	return content, nil
+	return content, usage, nil
 }
 
 // snippet 压缩空白并截断到 200 字符，用于错误信息中展示响应体片段。

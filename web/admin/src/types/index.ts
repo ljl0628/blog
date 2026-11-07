@@ -7,3 +7,5 @@ export * from './auth';
 export * from './task';
 export * from './article';
 export * from './rag';
+export * from './metrics';
+export * from './ragEval';

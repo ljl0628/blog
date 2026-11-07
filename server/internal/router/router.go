@@ -25,6 +25,8 @@ type Deps struct {
 	Articles *service.ArticleService
 	Portal   *service.PortalService
 	Rag      *service.RagService
+	Metrics  *service.MetricsService
+	RagEval  *service.RagEvalService
 }
 
 // New 构建 gin 引擎与全部路由：
@@ -57,6 +59,8 @@ func New(d Deps) *gin.Engine {
 	portalHandler := api.NewPortalHandler(d.Portal)
 	// RAG 问答：每 IP 每分钟 10 次（0 取默认值）
 	ragHandler := api.NewRagHandler(d.Rag, 0, d.Log)
+	metricsHandler := api.NewMetricsHandler(d.Metrics)
+	ragEvalHandler := api.NewRagEvalHandler(d.RagEval)
 
 	v1 := r.Group("/api/v1")
 
@@ -80,6 +84,12 @@ func New(d Deps) *gin.Engine {
 		admin.POST("/articles/:id/publish", articleHandler.Publish)
 		admin.POST("/articles/:id/offline", articleHandler.Offline)
 		admin.POST("/articles/:id/regenerate-figures", articleHandler.RegenerateFigures)
+		// 单张配图按指令 AI 修改（封面除外，随正文重新生成）：
+		// modify 只出预览不落库，用户确认后 apply 才更新文章
+		admin.POST("/articles/:id/figures/:figureId/modify", articleHandler.ModifyFigure)
+		admin.POST("/articles/:id/figures/:figureId/apply", articleHandler.ApplyFigure)
+		// 文章 LLM 评审记录：管理端审核参考（只读，最新 10 条）
+		admin.GET("/articles/:id/reviews", articleHandler.GetReviews)
 
 		// profile：与登录共用 AuthHandler，走 admin JWT 组
 		admin.GET("/auth/profile", authHandler.Profile)
@@ -94,6 +104,20 @@ func New(d Deps) *gin.Engine {
 		admin.GET("/rag/probe", ragHandler.Probe)
 		// 无命中问题列表：选题回流（管理端）
 		admin.GET("/rag/unanswered", ragHandler.ListUnanswered)
+
+		// LLM 用量看板：总览 + 按日 × 场景聚合（只读，数据源 llm_usage）
+		admin.GET("/metrics/summary", metricsHandler.Summary)
+		admin.GET("/metrics/daily", metricsHandler.Daily)
+
+		// RAG 回归评测：评测集 CRUD + 无命中问题回流补录 + 评测轮触发与查询
+		admin.GET("/rag-eval/cases", ragEvalHandler.ListCases)
+		admin.POST("/rag-eval/cases", ragEvalHandler.CreateCase)
+		admin.PUT("/rag-eval/cases/:id", ragEvalHandler.UpdateCase)
+		admin.DELETE("/rag-eval/cases/:id", ragEvalHandler.DeleteCase)
+		admin.POST("/rag-eval/cases/import-unanswered", ragEvalHandler.ImportFromUnanswered)
+		admin.POST("/rag-eval/run", ragEvalHandler.RunEval)
+		admin.GET("/rag-eval/runs", ragEvalHandler.ListRuns)
+		admin.GET("/rag-eval/runs/:id", ragEvalHandler.GetRun)
 	}
 
 	// 前台只读（公开）

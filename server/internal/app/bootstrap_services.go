@@ -16,6 +16,10 @@ func (a *App) initServices(context.Context) error {
 	a.taskSvc = service.NewTaskService(a.db, a.rdb, a.publisher, a.log)
 	a.articleSvc = service.NewArticleService(a.db, a.rdb, a.llmClient, mail, a.ragSvc, a.log)
 	a.portalSvc = service.NewPortalService(a.db, a.rdb, a.ragSvc, a.log)
+	// LLM 用量看板：只读聚合查询 + 内存价目表估成本（pricing 可为空，成本按 0）
+	a.metricsSvc = service.NewMetricsService(a.db, a.cfg.LLM.Pricing)
+	// RAG 回归评测：复用 ragSvc（与线上问答同口径的检索链与问答客户端）
+	a.ragEvalSvc = service.NewRagEvalService(a.db, a.ragSvc, a.cfg.RAG, a.log)
 	// 运行中任务可被主动取消：service 层回调 consumer 的按任务取消
 	a.taskSvc.SetCancelFunc(a.consumer.CancelTask)
 	// 删除任务时同步清理文章在 Qdrant 的残留向量

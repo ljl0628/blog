@@ -159,6 +159,107 @@ func (h *ArticleHandler) RegenerateFigures(c *gin.Context) {
 	resp.OK(c, detail)
 }
 
+// ModifyFigure POST /api/v1/articles/:id/figures/:figureId/modify：按指令 AI 修改单张配图。
+// 只产出预览（新标题/数据/渲染 SVG + 变更摘要），不落库；用户确认后调
+// ApplyFigure 才更新文章。涉及 LLM 调用，耗时较长，前端需放宽请求超时；
+// 失败时原图保持不变。
+//
+//	@Summary 按指令 AI 修改配图（返回预览，不落库）
+//	@Tags 文章
+//	@Security BearerAuth
+//	@Accept json
+//	@Produce json
+//	@Param id path int true "文章 ID"
+//	@Param figureId path int true "配图 ID（SvgAsset 主键）"
+//	@Param body body modifyFigureRequest true "修改指令（必填，≤200 字）"
+//	@Success 200 {object} resp.Envelope{data=service.FigurePreview}
+//	@Router /articles/{id}/figures/{figureId}/modify [post]
+func (h *ArticleHandler) ModifyFigure(c *gin.Context) {
+	id, okID := httputil.PathUint(c, "id")
+	if !okID {
+		return
+	}
+	figureID, okFig := httputil.PathUint(c, "figureId")
+	if !okFig {
+		return
+	}
+	var req modifyFigureRequest
+	if !httputil.BindJSON(c, &req) {
+		return
+	}
+	preview, err := h.svc.ModifyFigure(c.Request.Context(), id, figureID, req.Instruction)
+	if err != nil {
+		resp.FailWith(c, err)
+		return
+	}
+	resp.OK(c, preview)
+}
+
+// ApplyFigure POST /api/v1/articles/:id/figures/:figureId/apply：确认应用配图修改。
+// body 为 modify 返回的预览候选版本（title + spec），后端重校验并渲染后落库。
+//
+//	@Summary 确认应用配图修改（落库）
+//	@Tags 文章
+//	@Security BearerAuth
+//	@Accept json
+//	@Produce json
+//	@Param id path int true "文章 ID"
+//	@Param figureId path int true "配图 ID（SvgAsset 主键）"
+//	@Param body body applyFigureRequest true "预览返回的 title 与 spec"
+//	@Success 200 {object} resp.Envelope{data=service.FigureMeta}
+//	@Router /articles/{id}/figures/{figureId}/apply [post]
+func (h *ArticleHandler) ApplyFigure(c *gin.Context) {
+	id, okID := httputil.PathUint(c, "id")
+	if !okID {
+		return
+	}
+	figureID, okFig := httputil.PathUint(c, "figureId")
+	if !okFig {
+		return
+	}
+	var req applyFigureRequest
+	if !httputil.BindJSON(c, &req) {
+		return
+	}
+	meta, err := h.svc.ApplyFigureChange(c.Request.Context(), id, figureID, req.Title, req.Spec)
+	if err != nil {
+		resp.FailWith(c, err)
+		return
+	}
+	resp.OK(c, meta)
+}
+
+// GetReviews GET /api/v1/articles/:id/reviews：文章的 LLM 评审记录列表（最新 10 条）。
+//
+//	@Summary 文章评审记录（管理端）
+//	@Tags 文章
+//	@Security BearerAuth
+//	@Produce json
+//	@Param id path int true "文章 ID"
+//	@Success 200 {object} resp.Envelope{data=[]model.ArticleReview}
+//	@Router /articles/{id}/reviews [get]
+func (h *ArticleHandler) GetReviews(c *gin.Context) {
+	id, okID := httputil.PathUint(c, "id")
+	if !okID {
+		return
+	}
+	reviews, err := h.svc.ListReviews(c.Request.Context(), id)
+	if err != nil {
+		resp.FailWith(c, err)
+		return
+	}
+	resp.OK(c, reviews)
+}
+
+type modifyFigureRequest struct {
+	Instruction string `json:"instruction" binding:"required"` // 修改指令（非空，长度校验在 service）
+}
+
+type applyFigureRequest struct {
+	Title string `json:"title" binding:"required"` // 预览返回的新标题
+	Spec  string `json:"spec" binding:"required"`  // 预览返回的新图数据 JSON 文本
+}
+
 type updateArticleRequest struct {
 	Title     string   `json:"title"`
 	Summary   string   `json:"summary"`

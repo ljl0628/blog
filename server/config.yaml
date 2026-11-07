@@ -29,12 +29,21 @@ llm:
   temperature: 0.7
   max_tokens: 16384 # Anthropic 协议必传且思考已关闭，16K 保证长文不被截断
   rate_per_minute: 20
+  # judge 自动打分：生成完成后按准确/结构/可读/配图四维给文章打质量分（各 1-5 分）
+  judge_model: "" # 打分模型，留空复用 model（主模型）；可由 .env 的 LLM_JUDGE_MODEL 覆盖
+  judge_enabled: true # 生成时自动打分开关，false 时生成流程整段跳过 judge（文章无质量分）
   # 本地调试（mode=debug）覆盖项：改用免费模型跑通流水线，不消耗生成套餐额度；
   # 生产（release）以下三项均不生效。dev_max_tokens 不得超过所选模型输出上限
   # （glm-4-flash 为 4095；长文不截断可换同为免费的 glm-4.5-flash，输出上限 96K）
   dev_base_url: https://open.bigmodel.cn/api/paas/v4
   dev_model: glm-4-flash
   dev_max_tokens: 4095
+  # 模型价目表（元 / 1k token），键=模型名；仅用于看板成本估算，示例值请按厂商最新价目核对；
+  # 免费模型填 0。map 结构无法用环境变量覆盖，非密钥，直接写在本文件
+  pricing:
+    glm-5.3: { prompt: 0.5, completion: 2.0 }
+    glm-4-flash: { prompt: 0, completion: 0 }   # 免费档
+    BAAI/bge-m3: { prompt: 0, completion: 0 }   # SiliconFlow 免费档
 
 auth:
   jwt_secret: "" # 私密项：由 .env 的 AUTH_JWT_SECRET 注入（openssl rand -hex 32 生成）
@@ -96,3 +105,5 @@ rag:
   rerank_base_url: "" # 留空复用 embedding_base_url
   rerank_api_key: "" # 留空复用 embedding_api_key
   rerank_candidates: 20 # 粗排候选量（进入精排的块数），应明显大于 top_k
+  # 评测轮（管理平台触发 RAG 回归评测）是否跑 judge 给每条回答打分；关闭则只统计命中/引用指标
+  eval_judge: true

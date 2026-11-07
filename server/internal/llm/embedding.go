@@ -10,8 +10,10 @@ import (
 	"time"
 
 	"blog/server/internal/config"
+	"blog/server/internal/model"
 
 	"go.uber.org/zap"
+	"gorm.io/gorm"
 )
 
 // Embedder OpenAI 兼容 /embeddings 端点客户端：文本向量化，供 RAG 检索使用。
@@ -24,11 +26,13 @@ type Embedder struct {
 	dims           int
 	sendDimensions bool
 	http           *http.Client
+	db             *gorm.DB // 可为 nil，跳过用量落库（与 Client.db 同模式）
 	log            *zap.Logger
 }
 
-// NewEmbedder 创建 embedding 客户端；base_url/api_key 未单独配置时回落到 chat 配置。
-func NewEmbedder(cfg config.RAG, chat config.LLM, log *zap.Logger) *Embedder {
+// NewEmbedder 创建 embedding 客户端；base_url/api_key 未单独配置时回落到 chat 配置；
+// db 可为 nil（跳过用量落库）。
+func NewEmbedder(cfg config.RAG, chat config.LLM, db *gorm.DB, log *zap.Logger) *Embedder {
 	base := cfg.EmbeddingBaseURL
 	if base == "" {
 		base = chat.BaseURL
@@ -44,6 +48,7 @@ func NewEmbedder(cfg config.RAG, chat config.LLM, log *zap.Logger) *Embedder {
 		dims:           cfg.EmbeddingDimensions,
 		sendDimensions: cfg.EmbeddingSendDimensions,
 		http:           &http.Client{Timeout: 60 * time.Second},
+		db:             db,
 		log:            log,
 	}
 }
@@ -56,6 +61,12 @@ type embedRequest struct {
 	Dimensions *int     `json:"dimensions,omitempty"`
 }
 
+// usageEmbed 是 /embeddings 响应中的 token 用量（只有输入侧计费，无 completion 概念）。
+type usageEmbed struct {
+	PromptTokens int `json:"prompt_tokens"`
+	TotalTokens  int `json:"total_tokens"`
+}
+
 // embedResponse /embeddings 响应体；data[i].index 标记与输入的对应关系。
 type embedResponse struct {
 	Data []struct {
@@ -65,6 +76,7 @@ type embedResponse struct {
 	Error *struct {
 		Message string `json:"message"`
 	} `json:"error"`
+	Usage *usageEmbed `json:"usage"`
 }
 
 // Embed 批量向量化文本，返回向量顺序与输入一致；网络/HTTP 错误指数退避重试。
@@ -82,7 +94,11 @@ func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, erro
 			case <-time.After(time.Duration(1<<uint(attempt-1)) * time.Second):
 			}
 		}
-		err := e.embedOnce(ctx, texts, out)
+		// 埋点粒度 = 物理请求：每次 embedOnce（一次 HTTP 往返）各记一行用量，
+		// 网络重试 N 次记 N 行（与 Client.chatWithRetry 同粒度）。
+		start := time.Now()
+		usage, err := e.embedOnce(ctx, texts, out)
+		e.recordUsage(usage, start, err)
 		if err == nil {
 			return out, nil
 		}
@@ -92,8 +108,38 @@ func (e *Embedder) Embed(ctx context.Context, texts []string) ([][]float32, erro
 	return nil, lastErr
 }
 
+// recordUsage 把一次 embedding 物理请求的用量落库（llm_usage 表），逻辑对齐
+// Client.recordUsage（两者分属不同结构体，为控制改动面不做提取复用）：
+// token 数来自响应 usage 字段（缺失记零值），callErr 非空时记为 error 行；
+// db 为 nil 时直接返回；落库失败仅告警，不影响调用主流程。
+// 记账不随调用方 ctx 取消而丢失（同 Client.recordUsage），内部用独立短超时 ctx。
+func (e *Embedder) recordUsage(u usageInfo, start time.Time, callErr error) {
+	wctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if e.db == nil {
+		return
+	}
+	rec := model.LlmUsage{
+		Scene:            model.LlmSceneEmbedding,
+		Model:            e.model,
+		PromptTokens:     u.Prompt,
+		CompletionTokens: u.Completion, // embedding 无输出 token，恒为 0
+		DurationMS:       int(time.Since(start).Milliseconds()),
+		Status:           usageStatusSuccess,
+	}
+	if callErr != nil {
+		rec.Status = usageStatusError
+		rec.Error = truncRunes(callErr.Error(), maxUsageErrorRunes)
+	}
+	if err := e.db.WithContext(wctx).Create(&rec).Error; err != nil {
+		e.log.Warn("embedding 用量落库失败", zap.Error(err))
+	}
+}
+
 // embedOnce 单次调用 /embeddings，按响应中的 index 回填结果。
-func (e *Embedder) embedOnce(ctx context.Context, texts []string, out [][]float32) error {
+// 返回的 usageInfo 来自响应 usage 字段（embedding 只有输入侧计费，
+// 映射时 Completion 恒为 0），响应缺失该字段时为零值。
+func (e *Embedder) embedOnce(ctx context.Context, texts []string, out [][]float32) (usageInfo, error) {
 	var dims *int
 	if e.sendDimensions {
 		dims = &e.dims
@@ -104,47 +150,52 @@ func (e *Embedder) embedOnce(ctx context.Context, texts []string, out [][]float3
 		Dimensions: dims,
 	})
 	if err != nil {
-		return err
+		return usageInfo{}, err
 	}
 	url := strings.TrimSuffix(e.baseURL, "/") + "/embeddings"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
-		return err
+		return usageInfo{}, err
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+e.apiKey)
 
 	resp, err := e.http.Do(req)
 	if err != nil {
-		return err
+		return usageInfo{}, err
 	}
 	defer resp.Body.Close()
 
 	var er embedResponse
 	dec := json.NewDecoder(resp.Body)
 	if err := dec.Decode(&er); err != nil {
-		return fmt.Errorf("响应解析失败(HTTP %d): %w", resp.StatusCode, err)
+		return usageInfo{}, fmt.Errorf("响应解析失败(HTTP %d): %w", resp.StatusCode, err)
+	}
+	var usage usageInfo // 响应不含 usage 字段时保持零值
+	if er.Usage != nil {
+		usage.Prompt = er.Usage.PromptTokens
 	}
 	if resp.StatusCode != http.StatusOK || er.Error != nil {
 		msg := http.StatusText(resp.StatusCode)
 		if er.Error != nil {
 			msg = er.Error.Message
 		}
-		return fmt.Errorf("接口返回 HTTP %d: %s", resp.StatusCode, msg)
+		// 已拿到响应体说明 token 已被厂商计费，语义错误也带上已解析的用量
+		return usage, fmt.Errorf("接口返回 HTTP %d: %s", resp.StatusCode, msg)
 	}
 	if len(er.Data) != len(texts) {
-		return fmt.Errorf("返回向量数 %d 与输入 %d 不一致", len(er.Data), len(texts))
+		return usage, fmt.Errorf("返回向量数 %d 与输入 %d 不一致", len(er.Data), len(texts))
 	}
 	for _, d := range er.Data {
 		if d.Index < 0 || d.Index >= len(out) {
-			return fmt.Errorf("非法向量下标 %d", d.Index)
+			return usage, fmt.Errorf("非法向量下标 %d", d.Index)
 		}
 		out[d.Index] = d.Embedding
 	}
 	for i, v := range out {
 		if len(v) == 0 {
-			return fmt.Errorf("第 %d 条文本未返回向量", i)
+			return usage, fmt.Errorf("第 %d 条文本未返回向量", i)
 		}
 	}
-	return nil
+	return usage, nil
 }

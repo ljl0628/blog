@@ -21,6 +21,8 @@ func (a *App) initHTTP(context.Context) error {
 			Articles: a.articleSvc,
 			Portal:   a.portalSvc,
 			Rag:      a.ragSvc,
+			Metrics:  a.metricsSvc,
+			RagEval:  a.ragEvalSvc,
 		}),
 		ReadHeaderTimeout: 10 * time.Second,
 	}
